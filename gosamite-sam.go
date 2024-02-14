@@ -38,6 +38,11 @@ var (
 		"C:\\Windows\\Temp\\seccopy",
 	}
 
+	clean = flag.Bool(
+		"cleanup",
+		false,
+		"Automatically delete saved copies of hives",
+	)
 	success bool = false
 
 	security = flag.Bool(
@@ -475,7 +480,11 @@ func cleanup() {
 func main() {
 	flag.Parse()
 	execute()
-	cleanup()
+
+	if *clean {
+		cleanup()
+	}
+
 	if success {
 		fmt.Println("[+] WOOOOOO! At least one hive was copied")
 		fmt.Println("[+] Have a nice day")

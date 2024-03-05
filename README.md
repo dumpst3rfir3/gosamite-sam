@@ -8,9 +8,26 @@ This ensures that you are properly testing whether security controls are capable
 
 ## Usage
 
-After building, just running `gosamite-sam` (either as admin, or with `SEBackupPrivilege`) will attempt to save the `SAM` and `SYSTEM` hives in `C:\Windows\Temp\`.
+**NOTE:** This tool should be run as admin.
 
-Running `gosamite-sam -security` (which must be run as admin) will also attempt to save the `SECURITY` hive, in addition to `SAM`/`SYSTEM`. **NOTE:** adding this option will greatly increase the likelihood of detection/blocking due to the requirements for saving the `SECURITY` hive. Unlike the permissions for `SAM`/`SYSTEM`, which only requires the `SEBackupPrivilege` privlege for saving, the ACL for the `SECURITY` hive does NOT allow READ access to local admins by default. However, local admins have 'Write DAC' access, so they can just give themselves READ access to `SECURITY` - which is what this code does if the `-security` option is passed. However, this change in permissions is often detected as suspicious behavior.
-* The code automatically reverts the permissions to what they were before gosamite-sam was executed, but sometimes, if there is a detection, the tool will get blocked and quarantined before it could finish executing. Therefore, **it is important to check the permissions of `SECURITY` before and after execution to make sure they are properly restored.
+After building, just running `gosamite-sam` (either as admin, or with `SEBackupPrivilege`) will attempt to save the `SECURITY`, `SYSTEM`, and `SAM` registry hives (in that order) in `C:\Windows\Temp\`. No cleanup of saved files will be performed. See the usage below for additional options:
 
-Adding the `-cleanup` option (e.g., `gosamite-sam -security -cleanup`) will make the tool automatically delete the saved copies of the hives (in `C:\Windows\Temp`, by default) after a 10 second sleep.
+```
+Usage:
+gosamite-sam [hives] [vsc] [clean]
+
+Options:
+hives (can be any subset in any order):
+    SYSTEM
+    SECURITY
+    SAM
+(Default: All 3, in the above order)
+vsc: use volume shadow copy instead of registry
+clean: automatically remove any saved files after a 10 sec sleep
+(copied files will be saved in C:\Windows\Temp)
+```
+
+**NOTE:** when using the `vsc` option, if a new volume shadow copy is created (i.e., if there were none already on the target system), the tool will attempt to delete the volume shadow copy once it is done copying files. There is a good chance these deletion will trigger a detection or block from AV/EDR, since this resembles commonly-observed ransomware behavior. Manual cleanup of the volume shadow copy may be required.
+
+**NOTE:** Including the `SECURITY` registry hive (which is done by default) will greatly increase the likelihood of detection/blocking due to the requirements for saving the `SECURITY` hive. Unlike the permissions for `SAM`/`SYSTEM`, which only require the `SEBackupPrivilege` privilege for saving, the ACL for the `SECURITY` hive does NOT allow READ access to local admins by default. However, local admins have 'Write DAC' access, so they can just give themselves READ access to `SECURITY` - which is what this code does if the `SECURITY` hive is included. However, this change in permissions is often detected as suspicious behavior.
+* The code automatically reverts the permissions to what they were before gosamite-sam was executed, but sometimes, if there is a detection, the tool will get blocked and quarantined before it could finish executing. Therefore, **it is important to check the permissions of `SECURITY` before and after execution to make sure they are properly restored.**
